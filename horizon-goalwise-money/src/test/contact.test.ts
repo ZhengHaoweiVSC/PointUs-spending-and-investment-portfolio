@@ -1,0 +1,21 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { contactSchema, isContactTooQuick } from "@/lib/contact-schema";
+const mocks = vi.hoisted(() => ({ insert: vi.fn(), submit: vi.fn() }));
+vi.mock("@/integrations/supabase/client", () => ({ supabase: { from: () => ({ insert: mocks.insert }) } }));
+vi.mock("@/lib/contact.functions", () => ({ submitContact: mocks.submit }));
+import { flushOutbox, OUTBOX_KEY, retryDelay, sendContact } from "@/lib/outbox";
+const payload = { client_id: "aa84ee7a-d23d-44b6-8032-9e438f193a22", name: "Phase A", email: "phase-a@example.org", organisation: "", topic: "feedback" as const, message: "Testing the contact redundancy safeguards.", consent: true as const, form_started_at: 1000, website: "" };
+beforeEach(() => { localStorage.clear(); vi.clearAllMocks(); Object.defineProperty(navigator, "onLine", { configurable: true, value: true }); });
+afterEach(() => { vi.useRealTimers(); });
+describe("contact safeguards", () => {
+  it("rejects a submission before 3 seconds", () => { expect(isContactTooQuick(1000, 3999)).toBe(true); expect(isContactTooQuick(1000, 4000)).toBe(false); });
+  it("rejects a filled honeypot", () => expect(contactSchema.safeParse({ ...payload, website: "spam" }).success).toBe(false));
+  it("requires 20 message characters", () => { expect(contactSchema.safeParse({ ...payload, message: "x".repeat(19) }).success).toBe(false); expect(contactSchema.safeParse({ ...payload, message: "x".repeat(20) }).success).toBe(true); });
+  it("requires consent", () => expect(contactSchema.safeParse({ ...payload, consent: false }).success).toBe(false));
+  it("sends primary without direct insert", async () => { mocks.submit.mockResolvedValue({ ok: true }); expect((await sendContact(payload)).via).toBe("server"); expect(mocks.insert).not.toHaveBeenCalled(); });
+  it("falls back to direct insert with the same client_id", async () => { mocks.submit.mockRejectedValue(new Error("unavailable")); mocks.insert.mockResolvedValue({ error: null }); expect((await sendContact(payload)).via).toBe("direct"); expect(mocks.insert).toHaveBeenCalledWith(expect.objectContaining({ client_id: payload.client_id })); });
+  it("does not bypass the primary rate limit", async () => { mocks.submit.mockResolvedValue({ ok: false }); expect((await sendContact(payload)).status).toBe("rate_limited"); expect(mocks.insert).not.toHaveBeenCalled(); });
+  it("accepts duplicate client_id as delivered", async () => { mocks.submit.mockRejectedValue(new Error("unavailable")); mocks.insert.mockResolvedValue({ error: { code: "23505" } }); expect((await sendContact(payload)).status).toBe("sent"); });
+  it("queues one offline copy and delivers on reconnect", async () => { Object.defineProperty(navigator, "onLine", { configurable: true, value: false }); await sendContact(payload); await sendContact(payload); expect(JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]")).toHaveLength(1); Object.defineProperty(navigator, "onLine", { configurable: true, value: true }); mocks.submit.mockResolvedValue({ ok: true }); await flushOutbox(true); expect(JSON.parse(localStorage.getItem(OUTBOX_KEY) || "[]")).toHaveLength(0); });
+  it("backs off exponentially to a one-hour cap", () => { expect(retryDelay(1)).toBe(10000); expect(retryDelay(2)).toBe(20000); expect(retryDelay(20)).toBe(3600000); });
+});

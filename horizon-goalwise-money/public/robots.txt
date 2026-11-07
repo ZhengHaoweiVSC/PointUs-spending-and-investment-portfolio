@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Disallow: /app
+Disallow: /onboarding
+Disallow: /demo
+
+Sitemap: https://horizon-goalwise-money.lovable.app/sitemap.xml
